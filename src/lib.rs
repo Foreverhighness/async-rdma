@@ -1078,6 +1078,14 @@ async fn tcp_connect_helper<A: ToSocketAddrs>(
     ep: &QueuePairEndpoint,
 ) -> io::Result<QueuePairEndpoint> {
     let mut stream = TcpStream::connect(addr).await?;
+    exchange_metadata_client(&mut stream, ep).await
+}
+
+/// Exchange metadata through existing `TcpStream`, client side
+async fn exchange_metadata_client(
+    stream: &mut TcpStream,
+    ep: &QueuePairEndpoint,
+) -> io::Result<QueuePairEndpoint> {
     let mut endpoint = bincode::serialize(ep).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1095,13 +1103,11 @@ async fn tcp_connect_helper<A: ToSocketAddrs>(
     })
 }
 
-/// Listen for exchanging metadata through tcp
-async fn tcp_listen(
-    tcp_listener: &TcpListener,
+/// Exchange metadata through existing `TcpStream`, server side
+async fn exchange_metadata_server(
+    stream: &mut TcpStream,
     ep: &QueuePairEndpoint,
 ) -> io::Result<QueuePairEndpoint> {
-    let (mut stream, _) = tcp_listener.accept().await?;
-
     let endpoint_size = bincode::serialized_size(ep).map_err(|e| {
         io::Error::new(
             io::ErrorKind::Other,
@@ -1125,6 +1131,15 @@ async fn tcp_listen(
     })?;
     stream.write_all(&local).await?;
     Ok(remote)
+}
+
+/// Listen for exchanging metadata through tcp
+async fn tcp_listen(
+    tcp_listener: &TcpListener,
+    ep: &QueuePairEndpoint,
+) -> io::Result<QueuePairEndpoint> {
+    let (mut stream, _) = tcp_listener.accept().await?;
+    exchange_metadata_server(&mut stream, ep).await
 }
 
 /// Exchange metadata and setup connection through cm
@@ -1587,6 +1602,30 @@ impl Rdma {
             ConnectionType::RCSocket => {
                 let mut rdma = self.clone()?;
                 let remote = tcp_connect_helper(addr, &rdma.endpoint()).await?;
+                self.clone_attr.rq_attr_mut().reset_remote_info(&remote);
+                let (recv_attr, send_attr) = self.get_rq_sq_attr()?;
+                rdma.qp_handshake(recv_attr, send_attr)?;
+                rdma.init_agent(
+                    self.clone_attr.agent_attr.max_message_length,
+                    self.clone_attr.agent_attr.max_rmr_access,
+                )
+                .await?;
+                Ok(rdma)
+            }
+            ConnectionType::RCCM | ConnectionType::RCIBV => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "ConnectionType should be XXSocket",
+            )),
+        }
+    }
+
+    /// Establish new connections with RDMA server using the same `mr_allocator` and `event_listener` as parent `Rdma` by using existing `tokio::net::TcpStream`
+    #[inline]
+    pub async fn new_connect_by_stream(&mut self, stream: &mut TcpStream) -> io::Result<Self> {
+        match self.conn_type {
+            ConnectionType::RCSocket => {
+                let mut rdma = self.clone()?;
+                let remote = exchange_metadata_client(stream, &rdma.endpoint()).await?;
                 self.clone_attr.rq_attr_mut().reset_remote_info(&remote);
                 let (recv_attr, send_attr) = self.get_rq_sq_attr()?;
                 rdma.qp_handshake(recv_attr, send_attr)?;
@@ -3802,7 +3841,7 @@ impl Rdma {
 
     /// Get information of this qp for establishing a connection.
     ///
-    ///  
+    ///
     #[inline]
     #[must_use]
     pub fn get_qp_endpoint(&self) -> QueuePairEndpoint {
