@@ -1619,28 +1619,61 @@ impl Rdma {
         }
     }
 
-    /// Establish new connections with RDMA server using the same `mr_allocator` and `event_listener` as parent `Rdma` by using existing `tokio::net::TcpStream`
+    /// Receive metadata from the RDMA server using the same `mr_allocator` and `event_listener` as the parent `Rdma`
+    /// using the existing `tokio::net::TcpStream`.
+    ///
+    /// Used with `transmit_metadata_by_stream`
     #[inline]
-    pub async fn new_connect_by_stream(&mut self, stream: &mut TcpStream) -> io::Result<Self> {
-        match self.conn_type {
-            ConnectionType::RCSocket => {
-                let mut rdma = self.clone()?;
-                let remote = exchange_metadata_client(stream, &rdma.endpoint()).await?;
-                self.clone_attr.rq_attr_mut().reset_remote_info(&remote);
-                let (recv_attr, send_attr) = self.get_rq_sq_attr()?;
-                rdma.qp_handshake(recv_attr, send_attr)?;
-                rdma.init_agent(
-                    self.clone_attr.agent_attr.max_message_length,
-                    self.clone_attr.agent_attr.max_rmr_access,
-                )
-                .await?;
-                Ok(rdma)
-            }
-            ConnectionType::RCCM | ConnectionType::RCIBV => Err(io::Error::new(
+    pub async fn receive_metadata_by_stream(&mut self, stream: &mut TcpStream) -> io::Result<Self> {
+        if !matches!(self.conn_type, ConnectionType::RCSocket) {
+            return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "ConnectionType should be XXSocket",
-            )),
+            ));
         }
+
+        let mut rdma = self.clone()?;
+        let remote = exchange_metadata_server(stream, &rdma.endpoint()).await?;
+        self.clone_attr.rq_attr_mut().reset_remote_info(&remote);
+        let (recv_attr, send_attr) = self.get_rq_sq_attr()?;
+        rdma.qp_handshake(recv_attr, send_attr)?;
+        debug!("stream server handshake done");
+        rdma.init_agent(
+            self.clone_attr.agent_attr.max_message_length,
+            self.clone_attr.agent_attr.max_rmr_access,
+        )
+        .await?;
+        Ok(rdma)
+    }
+
+    /// Transmit metadata to the RDMA server with the same `mr_allocator` and `event_listener` as the parent `Rdma`
+    /// using the existing `tokio::net::TcpStream`.
+    ///
+    /// Used with `receive_metadata_by_stream`
+    #[inline]
+    pub async fn transmit_metadata_by_stream(
+        &mut self,
+        stream: &mut TcpStream,
+    ) -> io::Result<Self> {
+        if !matches!(self.conn_type, ConnectionType::RCSocket) {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "ConnectionType should be XXSocket",
+            ));
+        }
+
+        let mut rdma = self.clone()?;
+        let remote = exchange_metadata_client(stream, &rdma.endpoint()).await?;
+        self.clone_attr.rq_attr_mut().reset_remote_info(&remote);
+        let (recv_attr, send_attr) = self.get_rq_sq_attr()?;
+        rdma.qp_handshake(recv_attr, send_attr)?;
+        debug!("stream client handshake done");
+        rdma.init_agent(
+            self.clone_attr.agent_attr.max_message_length,
+            self.clone_attr.agent_attr.max_rmr_access,
+        )
+        .await?;
+        Ok(rdma)
     }
 
     /// Send the content in the `lm`
